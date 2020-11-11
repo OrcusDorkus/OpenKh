@@ -1,10 +1,8 @@
-using OpenKh.Common;
 using OpenKh.Engine.Maths;
 using OpenKh.Kh2;
 using OpenKh.Ps2;
 using System;
 using System.Collections.Generic;
-using System.IO;
 using System.Linq;
 using System.Numerics;
 
@@ -19,6 +17,51 @@ namespace OpenKh.Engine.Parsers.Kddf2
             public bool IsOpaque;
         }
 
+        private class RingBuffer
+        {
+            public VertexRef[] ringBuffer = new VertexRef[4];
+            public int ringIndex = 0;
+        }
+
+        private class VertexAssignment
+        {
+            public int matrixIndex;
+            public float weight = 1f;
+            public Vector4 rawPos;
+        }
+
+        private class VertexRef
+        {
+            public int vertexIndex, uvIndex;
+
+            public VertexRef(int vertexIndex, int uvIndex)
+            {
+                this.vertexIndex = vertexIndex;
+                this.uvIndex = uvIndex;
+            }
+        }
+
+        private class TriangleRef
+        {
+            public TriangleRef(int textureIndex, bool isOpaque, VertexRef one, VertexRef two, VertexRef three)
+            {
+                this.textureIndex = textureIndex;
+                this.isOpaque = isOpaque;
+                this.list = new VertexRef[] { one, two, three };
+            }
+
+            public VertexRef[] list;
+            public int textureIndex;
+            public bool isOpaque;
+        }
+
+        private class ExportedMesh
+        {
+            public List<Vector3> positionList = new List<Vector3>();
+            public List<Vector2> uvList = new List<Vector2>();
+            public List<TriangleRef> triangleRefList = new List<TriangleRef>();
+        }
+
         public List<CI> MeshDescriptors { get; } = new List<CI>();
 
         private readonly List<ImmutableMesh> immultableMeshList;
@@ -29,24 +72,9 @@ namespace OpenKh.Engine.Parsers.Kddf2
         /// <param name="submodel"></param>
         public Kkdf2MdlxParser(Mdlx.SubModel submodel)
         {
-            immultableMeshList = new List<ImmutableMesh>();
-            foreach (Mdlx.DmaChain dmaChain in submodel.DmaChains)
-            {
-                foreach (Mdlx.DmaVif dmaVif in dmaChain.DmaVifs)
-                {
-                    const int tops = 0x00;
-
-                    var unpacker = new VifUnpacker(dmaVif.VifPacket)
-                    {
-                        Vif1_Tops = tops
-                    };
-                    unpacker.Run();
-
-                    var mesh = VU1Simulation.Run(unpacker.Memory, tops, dmaVif.TextureIndex, dmaVif.Alaxi);
-                    mesh.isOpaque = (dmaChain.RenderFlags & 1) == 0;
-                    immultableMeshList.Add(mesh);
-                }
-            }
+            immultableMeshList = submodel.DmaChains
+                .Select(x => new ImmutableMesh(x))
+                .ToList();
         }
 
         /// <summary>
@@ -57,49 +85,99 @@ namespace OpenKh.Engine.Parsers.Kddf2
         {
             var models = new SortedDictionary<Tuple<int, bool>, Model>();
 
-            var exportedMesh = new ExportedMesh();
+            var exportedMesh = ExportMeshNew(immultableMeshList, matrices);
 
+            int triangleRefCount = exportedMesh.triangleRefList.Count;
+            for (int triIndex = 0; triIndex < triangleRefCount; triIndex++)
             {
-                int vertexBaseIndex = 0;
-                int uvBaseIndex = 0;
-                VertexRef[] ringBuffer = new VertexRef[4];
-                int ringIndex = 0;
-                int[] triangleOrder = new int[] { 1, 3, 2 };
-                foreach (ImmutableMesh mesh in immultableMeshList)
+                TriangleRef triRef = exportedMesh.triangleRefList[triIndex];
+                Tuple<int, bool> modelKey = new Tuple<int, bool>(triRef.textureIndex, triRef.isOpaque);
+                Model model;
+                if (models.TryGetValue(modelKey, out model) == false)
                 {
-                    for (int x = 0; x < mesh.indexAssignmentList.Length; x++)
-                    {
-                        var indexAssign = mesh.indexAssignmentList[x];
+                    models[modelKey] = model = new Model();
+                }
+                for (int i = 0; i < triRef.list.Length; i++)
+                {
+                    VertexRef vertRef = triRef.list[i];
+                    Vector3 pos = exportedMesh.positionList[vertRef.vertexIndex];
+                    Vector2 uv = exportedMesh.uvList[vertRef.uvIndex];
+                    model.Vertices.Add(new CustomVertex.PositionColoredTextured(pos, -1, uv.X, uv.Y));
+                }
+            }
 
-                        VertexRef vertexRef = new VertexRef(
-                            vertexBaseIndex + indexAssign.indexToVertexAssignment,
-                            uvBaseIndex + x
-                        );
-                        ringBuffer[ringIndex] = vertexRef;
-                        ringIndex = (ringIndex + 1) & 3;
-                        int flag = indexAssign.vertexFlag;
-                        if (flag == 0x20 || flag == 0x00)
+            return new Kkdf2MdlxBuiltModel
+            {
+                textureIndexBasedModelDict = models,
+                parser = this,
+            };
+        }
+
+        private static ExportedMesh ExportMeshNew(List<ImmutableMesh> immultableMeshList, Matrix[] matrices)
+        {
+            var ringBuffer = new RingBuffer();
+            int vertexBaseIndex = 0;
+            int uvBaseIndex = 0;
+            var exportedMesh = new ExportedMesh();
+            foreach (var meshRoot in immultableMeshList)
+            {
+                for (int i = 0; i < meshRoot.VpuPackets.Count; i++)
+                {
+                    var mesh = meshRoot.VpuPackets[i];
+                    var matrixIndexList = meshRoot.DmaChain.DmaVifs[i].Alaxi;
+                    ProcessMeshNew(exportedMesh.triangleRefList, mesh, ringBuffer, vertexBaseIndex, uvBaseIndex,
+                        meshRoot.TextureIndex, meshRoot.IsOpaque);
+
+                    var positionList = exportedMesh.positionList;
+
+                    var vertexIndex = 0;
+                    var vertexAssignmentList = new VertexAssignment[mesh.Vertices.Length];
+                    for (var indexToMatrixIndex = 0; indexToMatrixIndex < mesh.VertexRange.Length; indexToMatrixIndex++)
+                    {
+                        var verticesCount = mesh.VertexRange[indexToMatrixIndex];
+                        for (var t = 0; t < verticesCount; t++)
                         {
-                            var triRef = new TriangleRef(mesh.textureIndex, mesh.isOpaque,
-                                ringBuffer[(ringIndex - triangleOrder[0]) & 3],
-                                ringBuffer[(ringIndex - triangleOrder[1]) & 3],
-                                ringBuffer[(ringIndex - triangleOrder[2]) & 3]
-                                );
-                            exportedMesh.triangleRefList.Add(triRef);
-                        }
-                        if (flag == 0x30 || flag == 0x00)
-                        {
-                            var triRef = new TriangleRef(mesh.textureIndex, mesh.isOpaque,
-                                ringBuffer[(ringIndex - triangleOrder[0]) & 3],
-                                ringBuffer[(ringIndex - triangleOrder[2]) & 3],
-                                ringBuffer[(ringIndex - triangleOrder[1]) & 3]
-                                );
-                            exportedMesh.triangleRefList.Add(triRef);
-                        }
+                            var vertex = mesh.Vertices[vertexIndex];
+                            vertexAssignmentList[vertexIndex++] = new VertexAssignment
+                            {
+                                matrixIndex = matrixIndexList[indexToMatrixIndex],
+                                weight = vertex.W,
+                                rawPos = new Vector4(vertex.X, vertex.Y, vertex.Z, vertex.W)
+                            };
+                        };
                     }
 
-                    exportedMesh.positionList.AddRange(
-                        mesh.vertexAssignmentsList.Select(
+                    var vertexAssignmentsList = vertexAssignmentList
+                        .Select(x => new VertexAssignment[] { x })
+                        .ToArray();
+
+                    // TODO:
+                    //if (vpu.Type == 1 && vpu.VertexMixerCount > 0)
+                    //{
+                    //    si.Position = (vpu.VertexMixerOffset + tops) * 0x10;
+                    //    var mixerCounts = Enumerable.Range(0, vpu.VertexMixerCount)
+                    //        .Select(x => br.ReadInt32()).ToList();
+
+                    //    var newVertexAssignList = new VertexAssignment[mixerCounts.Sum()][];
+                    //    var inputVertexIndex = 0;
+
+                    //    for (var i = 0; i < mixerCounts.Count; i++)
+                    //    {
+                    //        si.Position = (si.Position + 15) & (~15);
+                    //        for (var j = 0; j < mixerCounts[i]; j++)
+                    //        {
+                    //            newVertexAssignList[inputVertexIndex++] = Enumerable
+                    //                .Range(0, i + 1)
+                    //                .Select(x => vertexAssignmentList[br.ReadInt32()])
+                    //                .ToArray();
+                    //        }
+                    //    }
+
+                    //    mesh.vertexAssignmentsList = newVertexAssignList;
+                    //}
+
+                    positionList.AddRange(
+                        vertexAssignmentsList.Select(
                             vertexAssigns =>
                             {
                                 Vector3 finalPos = Vector3.Zero;
@@ -107,18 +185,18 @@ namespace OpenKh.Engine.Parsers.Kddf2
                                 {
                                     // single joint
                                     finalPos = TransformCoordinate(
-                                    VCUt.V4To3(
-                                        vertexAssigns[0].rawPos
-                                    ),
-                                    matrices[vertexAssigns[0].matrixIndex]
-                                );
+                                                    V4To3(
+                                                        vertexAssigns[0].rawPos
+                                                    ),
+                                                    matrices[vertexAssigns[0].matrixIndex]
+                                                );
                                 }
                                 else
                                 {
                                     // multiple joints, using rawPos.W as blend weights
                                     foreach (VertexAssignment vertexAssign in vertexAssigns)
                                     {
-                                        finalPos += VCUt.V4To3(
+                                        finalPos += V4To3(
                                             Transform(
                                                 vertexAssign.rawPos,
                                                 matrices[vertexAssign.matrixIndex]
@@ -132,64 +210,79 @@ namespace OpenKh.Engine.Parsers.Kddf2
                     );
 
                     exportedMesh.uvList.AddRange(
-                        mesh.indexAssignmentList
-                            .Select(indexAssign => indexAssign.uv)
+                        mesh.Indices.Select(x =>
+                            new Vector2(x.U / 16 / 256.0f, x.V / 16 / 256.0f))
                     );
 
-                    vertexBaseIndex += mesh.vertexAssignmentsList.Length;
-                    uvBaseIndex += mesh.indexAssignmentList.Length;
+                    vertexBaseIndex += vertexAssignmentsList.Length;
+                    uvBaseIndex += mesh.Indices.Length;
                 }
             }
 
+            return exportedMesh;
+        }
+
+        private static void ProcessMeshNew(
+            List<TriangleRef> triangleRefList, VpuPacket packet,
+            RingBuffer ringBuffer, int vertexBaseIndex, int uvBaseIndex,
+            int textureIndex, bool isOpaque)
+        {
+            int[] triangleOrder = new int[] { 1, 3, 2 };
+            for (var x = 0; x < packet.Indices.Length; x++)
             {
-                int triangleRefCount = exportedMesh.triangleRefList.Count;
-                for (int triIndex = 0; triIndex < triangleRefCount; triIndex++)
+                var indexAssign = packet.Indices[x];
+                VertexRef vertexRef = new VertexRef(
+                    vertexBaseIndex + indexAssign.Index,
+                    uvBaseIndex + x
+                );
+
+                ringBuffer.ringBuffer[ringBuffer.ringIndex] = vertexRef;
+                ringBuffer.ringIndex = (ringBuffer.ringIndex + 1) & 3;
+                var flag = indexAssign.Function;
+                if (flag == VpuPacket.VertexFunction.DrawTriangle ||
+                    flag == VpuPacket.VertexFunction.DrawTriangleDoubleSided)
                 {
-                    TriangleRef triRef = exportedMesh.triangleRefList[triIndex];
-                    Tuple<int, bool> modelKey = new Tuple<int, bool>(triRef.textureIndex, triRef.isOpaque);
-                    Model model;
-                    if (models.TryGetValue(modelKey, out model) == false)
-                    {
-                        models[modelKey] = model = new Model();
-                    }
-                    for (int i = 0; i < triRef.list.Length; i++)
-                    {
-                        VertexRef vertRef = triRef.list[i];
-                        Vector3 pos = exportedMesh.positionList[vertRef.vertexIndex];
-                        Vector2 uv = exportedMesh.uvList[vertRef.uvIndex];
-                        model.Vertices.Add(new CustomVertex.PositionColoredTextured(pos, -1, uv.X, uv.Y));
-                    }
+                    var triRef = new TriangleRef(textureIndex, isOpaque,
+                        ringBuffer.ringBuffer[(ringBuffer.ringIndex - triangleOrder[0]) & 3],
+                        ringBuffer.ringBuffer[(ringBuffer.ringIndex - triangleOrder[1]) & 3],
+                        ringBuffer.ringBuffer[(ringBuffer.ringIndex - triangleOrder[2]) & 3]
+                        );
+                    triangleRefList.Add(triRef);
+                }
+                if (flag == VpuPacket.VertexFunction.DrawTriangleInverse ||
+                    flag == VpuPacket.VertexFunction.DrawTriangleDoubleSided)
+                {
+                    var triRef = new TriangleRef(textureIndex, isOpaque,
+                        ringBuffer.ringBuffer[(ringBuffer.ringIndex - triangleOrder[0]) & 3],
+                        ringBuffer.ringBuffer[(ringBuffer.ringIndex - triangleOrder[2]) & 3],
+                        ringBuffer.ringBuffer[(ringBuffer.ringIndex - triangleOrder[1]) & 3]
+                        );
+                    triangleRefList.Add(triRef);
                 }
             }
-
-            return new Kkdf2MdlxBuiltModel
-            {
-                textureIndexBasedModelDict = models,
-                parser = this,
-            };
         }
 
         private static Vector3 TransformCoordinate(Vector3 coordinate, Matrix transformation)
         {
-            Vector4 vector4 = new Vector4();
-            vector4.X = (float)((double)transformation.M21 * (double)coordinate.Y + (double)transformation.M11 * (double)coordinate.X + (double)transformation.M31 * (double)coordinate.Z) + transformation.M41;
-            vector4.Y = (float)((double)transformation.M22 * (double)coordinate.Y + (double)transformation.M12 * (double)coordinate.X + (double)transformation.M32 * (double)coordinate.Z) + transformation.M42;
-            vector4.Z = (float)((double)transformation.M23 * (double)coordinate.Y + (double)transformation.M13 * (double)coordinate.X + (double)transformation.M33 * (double)coordinate.Z) + transformation.M43;
-            float num = (float)(1.0 / ((double)transformation.M24 * (double)coordinate.Y + (double)transformation.M14 * (double)coordinate.X + (double)transformation.M34 * (double)coordinate.Z + (double)transformation.M44));
-            vector4.W = num;
-            Vector3 vector3 = new Vector3(vector4.X * num, vector4.Y * num, vector4.Z * num);
-            return vector3;
+            var vector4 = new Vector4
+            {
+                X = (float)((double)transformation.M21 * coordinate.Y + (double)transformation.M11 * coordinate.X + (double)transformation.M31 * coordinate.Z) + transformation.M41,
+                Y = (float)((double)transformation.M22 * coordinate.Y + (double)transformation.M12 * coordinate.X + (double)transformation.M32 * coordinate.Z) + transformation.M42,
+                Z = (float)((double)transformation.M23 * coordinate.Y + (double)transformation.M13 * coordinate.X + (double)transformation.M33 * coordinate.Z) + transformation.M43,
+                W = (float)(1.0 / ((double)transformation.M24 * coordinate.Y + (double)transformation.M14 * coordinate.X + (double)transformation.M34 * coordinate.Z + transformation.M44))
+            };
+
+            return new Vector3(vector4.X * vector4.W, vector4.Y * vector4.W, vector4.Z * vector4.W);
         }
 
-        public static Vector4 Transform(Vector4 vector, Matrix transformation)
+        public static Vector4 Transform(Vector4 vector, Matrix transformation) => new Vector4()
         {
-            return new Vector4()
-            {
-                X = (float)((double)transformation.M21 * vector.Y + transformation.M11 * vector.X + transformation.M31 * vector.Z + transformation.M41 * vector.W),
-                Y = (float)((double)transformation.M22 * vector.Y + transformation.M12 * vector.X + transformation.M32 * vector.Z + transformation.M42 * vector.W),
-                Z = (float)((double)transformation.M23 * vector.Y + transformation.M13 * vector.X + transformation.M33 * vector.Z + transformation.M43 * vector.W),
-                W = (float)((double)transformation.M24 * vector.Y + transformation.M14 * vector.X + transformation.M34 * vector.Z + transformation.M44 * vector.W)
-            };
-        }
+            X = (float)((double)transformation.M21 * vector.Y + transformation.M11 * vector.X + transformation.M31 * vector.Z + transformation.M41 * vector.W),
+            Y = (float)((double)transformation.M22 * vector.Y + transformation.M12 * vector.X + transformation.M32 * vector.Z + transformation.M42 * vector.W),
+            Z = (float)((double)transformation.M23 * vector.Y + transformation.M13 * vector.X + transformation.M33 * vector.Z + transformation.M43 * vector.W),
+            W = (float)((double)transformation.M24 * vector.Y + transformation.M14 * vector.X + transformation.M34 * vector.Z + transformation.M44 * vector.W)
+        };
+
+        private static Vector3 V4To3(Vector4 pos) => new Vector3(pos.X, pos.Y, pos.Z);
     }
 }

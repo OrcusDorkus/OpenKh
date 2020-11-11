@@ -114,7 +114,7 @@ namespace OpenKh.Game
         protected override void Initialize()
         {
             _debugOverlay.Initialize(GetStateInitDesc());
-            State = 0;
+            State = 1;
 
             base.Initialize();
         }
